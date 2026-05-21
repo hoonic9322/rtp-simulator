@@ -13,6 +13,16 @@
         <div class="admin-filter-actions">
           <button
             type="button"
+            class="reset-button"
+            :disabled="pdfLoading"
+            @click="downloadPdfReport"
+          >
+            <i class="bi bi-file-earmark-pdf"></i>
+            {{ pdfLoading ? t('prizeConfig.downloadingPdf') : t('prizeConfig.downloadPdf') }}
+          </button>
+
+          <button
+            type="button"
             class="primary-button"
             :class="{ 'save-button-dirty': hasUnsavedChanges }"
             @click="saveConfiguration"
@@ -208,7 +218,11 @@
               <th class="text-right">{{ t('prizeConfig.expectedHitCount') }}</th>
               <th class="text-right">{{ t('prizeConfig.expectedPayout') }}</th>
               <th class="text-right">
-                {{ isFreeSpinMode ? t('prizeConfig.costContribution') : t('prizeConfig.rtpContribution') }}
+                {{
+                  isFreeSpinMode
+                    ? t('prizeConfig.costContribution')
+                    : t('prizeConfig.rtpContribution')
+                }}
               </th>
               <th class="text-center">{{ t('prizeConfig.active') }}</th>
               <th class="text-center">{{ t('prizeConfig.action') }}</th>
@@ -708,6 +722,7 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
+import html2pdf from 'html2pdf.js'
 
 import AppLayout from '../components/AppLayout.vue'
 import {
@@ -718,7 +733,7 @@ import {
   toNumber,
 } from '../utils/rtpCalculator'
 
-const { t } = useI18n()
+const { t, locale } = useI18n()
 
 const STORAGE_CONFIG_KEY = 'rtpSimulatorPrizeConfig'
 const STORAGE_PRIZES_KEY = 'rtpSimulatorPrizeList'
@@ -726,6 +741,7 @@ const STORAGE_PRIZES_KEY = 'rtpSimulatorPrizeList'
 const config = ref(createDefaultConfig())
 const prizes = ref(createDefaultPrizes())
 const hasUnsavedChanges = ref(false)
+const pdfLoading = ref(false)
 
 const toastMessage = ref('')
 const toastType = ref('warning')
@@ -968,6 +984,439 @@ function resetConfiguration() {
 
   hasUnsavedChanges.value = false
   showToast(t('prizeConfig.resetSuccess'), 'success')
+}
+
+/* =========================================================
+   PDF Report Download
+   ========================================================= */
+
+function waitForPdfRender() {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(resolve)
+    })
+  })
+}
+
+function getPdfLanguage() {
+  return locale.value === 'zh' ? 'zh' : 'en'
+}
+
+function getPdfFileName() {
+  const now = new Date()
+  const dateText = [
+    now.getFullYear(),
+    String(now.getMonth() + 1).padStart(2, '0'),
+    String(now.getDate()).padStart(2, '0'),
+  ].join('-')
+
+  const timeText = [
+    String(now.getHours()).padStart(2, '0'),
+    String(now.getMinutes()).padStart(2, '0'),
+  ].join('')
+
+  return getPdfLanguage() === 'zh'
+    ? `杀率配置报告-${dateText}-${timeText}.pdf`
+    : `rtp-configuration-report-${dateText}-${timeText}.pdf`
+}
+
+function getPdfGeneratedTime() {
+  const now = new Date()
+
+  const year = now.getFullYear()
+  const month = String(now.getMonth() + 1).padStart(2, '0')
+  const day = String(now.getDate()).padStart(2, '0')
+  const hour = String(now.getHours()).padStart(2, '0')
+  const minute = String(now.getMinutes()).padStart(2, '0')
+  const second = String(now.getSeconds()).padStart(2, '0')
+
+  const timezoneOffset = -now.getTimezoneOffset()
+  const timezoneSign = timezoneOffset >= 0 ? '+' : '-'
+  const timezoneHour = String(Math.floor(Math.abs(timezoneOffset) / 60)).padStart(2, '0')
+  const timezoneMinute = String(Math.abs(timezoneOffset) % 60).padStart(2, '0')
+
+  return `${year}-${month}-${day} ${hour}:${minute}:${second} UTC${timezoneSign}${timezoneHour}:${timezoneMinute}`
+}
+
+function getPrizeTypeText(prizeType) {
+  return prizeType === 'NO_PRIZE' ? t('prizeConfig.noPrize') : t('prizeConfig.cash')
+}
+
+function getWeightModeText() {
+  return isFreeSpinMode.value ? t('prizeConfig.freeSpin') : t('prizeConfig.paidSpin')
+}
+
+function getCalculationModeText() {
+  if (isFreeSpinMode.value) {
+    return t('prizeConfig.freeSpin')
+  }
+
+  return config.value.calculationMode === 'MANUAL_CHECK'
+    ? t('prizeConfig.manualCheckMode')
+    : t('prizeConfig.suggestPriceMode')
+}
+
+function buildPdfBasicRows() {
+  const rows = [
+    [t('prizeConfig.weightMode'), getWeightModeText()],
+    [t('prizeConfig.calculationMode'), getCalculationModeText()],
+    [t('prizeConfig.spinCount'), formatNumber(config.value.spinCount, 0)],
+    [t('prizeConfig.currency'), config.value.currency || 'USD'],
+  ]
+
+  if (!isFreeSpinMode.value) {
+    rows.push(
+      [t('prizeConfig.targetRtp'), formatPercent(currentSummary.value.targetRtp)],
+      [t('prizeConfig.targetKillRate'), formatPercent(currentSummary.value.targetKillRate)],
+      [t('prizeConfig.suggestedSpinCost'), formatMoney(currentSummary.value.suggestedSpinCost)],
+      [
+        config.value.calculationMode === 'MANUAL_CHECK'
+          ? t('prizeConfig.manualSpinCost')
+          : t('prizeConfig.finalSpinCost'),
+        config.value.calculationMode === 'MANUAL_CHECK'
+          ? formatMoney(currentSummary.value.manualSpinCost)
+          : formatMoney(currentSummary.value.finalSpinCost),
+      ],
+      [t('prizeConfig.effectiveSpinCost'), formatMoney(currentSummary.value.effectiveSpinCost)]
+    )
+  }
+
+  return rows
+}
+
+function buildPdfAnalysisRows() {
+  const rows = [
+    [t('prizeConfig.totalWeight'), formatNumber(currentSummary.value.totalWeight, 0)],
+    [t('prizeConfig.winRate'), formatPercent(currentSummary.value.winRate)],
+    [t('prizeConfig.noPrizeRate'), formatPercent(currentSummary.value.noPrizeRate)],
+    [t('prizeConfig.averagePayout'), formatMoney(currentSummary.value.averagePayout)],
+    [t('prizeConfig.totalPayout'), formatMoney(currentSummary.value.totalPayout)],
+  ]
+
+  if (isFreeSpinMode.value) {
+    rows.push(
+      [t('prizeConfig.companyEstimatedCost'), formatMoney(currentSummary.value.companyEstimatedCost)],
+      [t('prizeConfig.freeSpinNoRtpNote'), '-']
+    )
+  } else {
+    rows.push(
+      [t('prizeConfig.totalInvestment'), formatMoney(currentSummary.value.totalInvestment)],
+      [t('prizeConfig.actualRtp'), formatPercent(currentSummary.value.actualRtp)],
+      [t('prizeConfig.actualKillRate'), formatPercent(currentSummary.value.actualKillRate)],
+      [t('prizeConfig.companyProfit'), formatMoney(currentSummary.value.companyProfit)],
+      [t('prizeConfig.profitRate'), formatPercent(currentSummary.value.companyProfitRate)]
+    )
+  }
+
+  return rows
+}
+
+function buildPdfPrizeRows() {
+  return prizes.value.map((prize) => {
+    const row = getPrizeCalculatedRow(prize.id)
+    const activeWeight = isFreeSpinMode.value ? prize.freeWeight : prize.paidWeight
+
+    return {
+      prizeName: prize.prizeName || '-',
+      prizeType: getPrizeTypeText(prize.prizeType),
+      amount: formatMoney(prize.amount),
+      activeWeight: formatNumber(activeWeight, 0),
+      probability: formatPercent(row.probability),
+      expectedHitCount: formatNumber(row.expectedHitCount, 2),
+      expectedPayout: formatMoney(row.expectedPayout),
+      contribution: isFreeSpinMode.value
+        ? formatPercent(row.costContribution)
+        : formatPercent(row.rtpContribution),
+      active: prize.isActive ? t('prizeConfig.enabled') : t('prizeConfig.disabled'),
+    }
+  })
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#039;')
+}
+
+function renderPdfRows(rows) {
+  return rows
+    .map(
+      ([label, value]) => `
+        <div class="pdf-info-row">
+          <span>${escapeHtml(label)}</span>
+          <strong>${escapeHtml(value)}</strong>
+        </div>
+      `
+    )
+    .join('')
+}
+
+function renderPdfPrizeTable() {
+  const activeWeightTitle = isFreeSpinMode.value
+    ? t('prizeConfig.freeWeight')
+    : t('prizeConfig.paidWeight')
+
+  const contributionTitle = isFreeSpinMode.value
+    ? t('prizeConfig.costContribution')
+    : t('prizeConfig.rtpContribution')
+
+  const rows = buildPdfPrizeRows()
+    .map(
+      (item) => `
+        <tr>
+          <td>${escapeHtml(item.prizeName)}</td>
+          <td>${escapeHtml(item.prizeType)}</td>
+          <td class="text-right">${escapeHtml(item.amount)}</td>
+          <td class="text-right">${escapeHtml(item.activeWeight)}</td>
+          <td class="text-right">${escapeHtml(item.probability)}</td>
+          <td class="text-right">${escapeHtml(item.expectedHitCount)}</td>
+          <td class="text-right">${escapeHtml(item.expectedPayout)}</td>
+          <td class="text-right">${escapeHtml(item.contribution)}</td>
+          <td>${escapeHtml(item.active)}</td>
+        </tr>
+      `
+    )
+    .join('')
+
+  return `
+    <table class="pdf-table">
+      <thead>
+        <tr>
+          <th>${escapeHtml(t('prizeConfig.prizeName'))}</th>
+          <th>${escapeHtml(t('prizeConfig.prizeType'))}</th>
+          <th class="text-right">${escapeHtml(t('prizeConfig.amount'))}</th>
+          <th class="text-right">${escapeHtml(activeWeightTitle)}</th>
+          <th class="text-right">${escapeHtml(t('prizeConfig.currentProbability'))}</th>
+          <th class="text-right">${escapeHtml(t('prizeConfig.expectedHitCount'))}</th>
+          <th class="text-right">${escapeHtml(t('prizeConfig.expectedPayout'))}</th>
+          <th class="text-right">${escapeHtml(contributionTitle)}</th>
+          <th>${escapeHtml(t('prizeConfig.active'))}</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows}
+      </tbody>
+    </table>
+  `
+}
+
+function buildPdfHtml() {
+  const noteText = isFreeSpinMode.value
+    ? t('prizeConfig.freeSpinAnalysisDesc')
+    : t('prizeConfig.calculationSummaryDesc')
+
+  return `
+    <div class="pdf-report">
+      <style>
+        .pdf-report {
+          width: 100%;
+          box-sizing: border-box;
+          padding: 22px;
+          color: #111827;
+          background: #ffffff;
+          font-family: Arial, "Microsoft YaHei", "PingFang SC", sans-serif;
+        }
+
+        .pdf-title {
+          margin-bottom: 18px;
+          padding-bottom: 12px;
+          border-bottom: 2px solid #2563eb;
+        }
+
+        .pdf-title h1 {
+          margin: 0 0 6px;
+          font-size: 22px;
+          color: #111827;
+          font-weight: 800;
+        }
+
+        .pdf-title p {
+          margin: 0;
+          font-size: 12px;
+          color: #6b7280;
+        }
+
+        .pdf-section {
+          margin-top: 18px;
+          page-break-inside: avoid;
+        }
+
+        .pdf-section h2 {
+          margin: 0 0 10px;
+          font-size: 16px;
+          color: #1f2937;
+          font-weight: 800;
+        }
+
+        .pdf-info-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 8px 14px;
+        }
+
+        .pdf-info-row {
+          display: flex;
+          justify-content: space-between;
+          gap: 10px;
+          padding: 8px 10px;
+          border: 1px solid #e5e7eb;
+          border-radius: 6px;
+          background: #f9fafb;
+          font-size: 12px;
+        }
+
+        .pdf-info-row span {
+          color: #6b7280;
+        }
+
+        .pdf-info-row strong {
+          color: #111827;
+          text-align: right;
+        }
+
+        .pdf-note {
+          margin-top: 10px;
+          padding: 10px 12px;
+          border-radius: 6px;
+          background: #eff6ff;
+          color: #1e40af;
+          font-size: 12px;
+          line-height: 1.6;
+        }
+
+        .pdf-table {
+          width: 100%;
+          border-collapse: collapse;
+          font-size: 10px;
+        }
+
+        .pdf-table th {
+          padding: 7px 6px;
+          border: 1px solid #d1d5db;
+          background: #f3f4f6;
+          color: #374151;
+          text-align: left;
+          font-weight: 700;
+        }
+
+        .pdf-table td {
+          padding: 7px 6px;
+          border: 1px solid #e5e7eb;
+          color: #111827;
+          vertical-align: top;
+        }
+
+        .pdf-table tbody tr:nth-child(even) td {
+          background: #f9fafb;
+        }
+
+        .text-right {
+          text-align: right !important;
+        }
+      </style>
+
+      <div class="pdf-title">
+        <h1>${escapeHtml(t('prizeConfig.pdfReportTitle'))}</h1>
+        <p>${escapeHtml(t('prizeConfig.pdfGeneratedAt'))}: ${escapeHtml(getPdfGeneratedTime())}</p>
+      </div>
+
+      <div class="pdf-section">
+        <h2>${escapeHtml(t('prizeConfig.pdfBasicConfig'))}</h2>
+        <div class="pdf-info-grid">
+          ${renderPdfRows(buildPdfBasicRows())}
+        </div>
+      </div>
+
+      <div class="pdf-section">
+        <h2>${escapeHtml(t('prizeConfig.pdfAnalysisResult'))}</h2>
+        <div class="pdf-info-grid">
+          ${renderPdfRows(buildPdfAnalysisRows())}
+        </div>
+
+        <div class="pdf-note">
+          ${escapeHtml(noteText)}
+        </div>
+      </div>
+
+      <div class="pdf-section">
+        <h2>${escapeHtml(t('prizeConfig.pdfPrizeDetail'))}</h2>
+        ${renderPdfPrizeTable()}
+      </div>
+    </div>
+  `
+}
+
+async function downloadPdfReport() {
+  if (pdfLoading.value) {
+    return
+  }
+
+  pdfLoading.value = true
+
+  const reportElement = document.createElement('div')
+
+  try {
+    reportElement.innerHTML = buildPdfHtml()
+
+    Object.assign(reportElement.style, {
+      position: 'absolute',
+      left: '0',
+      top: '0',
+      width: '1120px',
+      minHeight: '600px',
+      background: '#ffffff',
+      zIndex: '99999',
+      pointerEvents: 'none',
+    })
+
+    document.body.appendChild(reportElement)
+
+    await waitForPdfRender()
+
+    const pdfTarget = reportElement.querySelector('.pdf-report') || reportElement
+
+    const options = {
+      margin: 8,
+      filename: getPdfFileName(),
+      image: {
+        type: 'jpeg',
+        quality: 0.98,
+      },
+      html2canvas: {
+        scale: 2,
+        useCORS: true,
+        allowTaint: true,
+        backgroundColor: '#ffffff',
+        scrollX: 0,
+        scrollY: 0,
+        windowWidth: 1120,
+      },
+      jsPDF: {
+        unit: 'mm',
+        format: 'a4',
+        orientation: 'landscape',
+      },
+      pagebreak: {
+        mode: ['css', 'legacy'],
+      },
+    }
+
+    await html2pdf().set(options).from(pdfTarget).save()
+
+    showToast(t('prizeConfig.pdfDownloadSuccess'), 'success')
+  } catch (error) {
+    console.error('PDF download failed:', error)
+    showToast(t('prizeConfig.pdfDownloadFailed'), 'warning')
+  } finally {
+    if (document.body.contains(reportElement)) {
+      document.body.removeChild(reportElement)
+    }
+
+    pdfLoading.value = false
+  }
 }
 
 function loadSavedConfiguration() {
